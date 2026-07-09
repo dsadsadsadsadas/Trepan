@@ -148,6 +148,24 @@ SemanticGuard isn't just a prompt; it's a **state machine**. It tracks your proj
 - 🟡 **0.3 - 0.6**: Warning (Review recommended)
 - 🔴 **0.6 - 1.0**: Critical (Auto-reject)
 
+### Repository Auditing Scripts
+
+Two standalone scripts provide the repo-scale audit pipeline outside the VS Code extension:
+
+| Script | Purpose | Local Dependencies |
+|--------|---------|--------------------|
+| `hunter.py` | High-signal repository hunter that slices code, injects threat intel, rate-limits model calls, and writes audit findings. | `indexer.py`, `st/token_bucket.py`, `threat_intel/signatures.py`, `semanticguard_utils/constants.py`, `semanticguard_utils/hashing.py` |
+| `indexer.py` | Fast structural indexer that maps routes, call chains, direct sinks, and drift indicators before the audit phase. | Python standard library only |
+
+Example usage:
+
+```bash
+python hunter.py --path /path/to/repo
+python indexer.py /path/to/repo
+```
+
+`hunter.py` is the orchestration layer. It uses `indexer.py` to build a context map, `threat_intel/signatures.py` to load triggers and scan policy, `st/token_bucket.py` to enforce shared RPM/TPM rate limits, and `semanticguard_utils` helpers to generate stable finding IDs and resolve the audit output directory.
+
 ---
 
 ## 🛠️ Configuration

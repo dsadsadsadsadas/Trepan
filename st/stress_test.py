@@ -66,30 +66,18 @@ class Config:
     max_file_size_kb: int = 500
     timeout_seconds: int = 60
 
-GROQ_MODELS = {
+OPENAI_MODELS = {
     "1": {
-        "name": "llama-3.3-70b-versatile",
-        "display": "Llama 3.3 70B Versatile",
-        "max_rpm": 30,
-        "max_tpm": 12000
+        "name": "gpt-5.4-mini",
+        "display": "OpenAI GPT-5.4 Mini (Tier-5)",
+        "max_rpm": 10000,
+        "max_tpm": 5000000
     },
     "2": {
-        "name": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "display": "Llama 4 Scout 17B",
-        "max_rpm": 30,
-        "max_tpm": 30000
-    },
-    "3": {
-        "name": "openai/gpt-oss-120b",
-        "display": "GPT OSS 120B",
-        "max_rpm": 30,
-        "max_tpm": 12000
-    },
-    "4": {
         "name": "custom",
-        "display": "Custom Model (Manual TPM Entry)",
-        "max_rpm": None,  # Will be prompted
-        "max_tpm": None   # Will be prompted
+        "display": "Custom Model (Manual Constraints)",
+        "max_rpm": None,
+        "max_tpm": None
     }
 }
 
@@ -376,27 +364,30 @@ class CodebaseScanner:
         print(f"{colored(f'[SKIP] Filtered {len(self.skipped_files)} files (safe/boilerplate)', Colors.DIM)}")
         return self.files
 
-# --- Groq API Client --------------------------------------------------------
+# --- OpenAI API Client --------------------------------------------------------
 
-class GroqAuditClient:
-    def __init__(self, api_key: str, model: str, rate_limiter: TokenBucket):
+class OpenAIAuditClient:
+    def __init__(self, api_key: str, model: str, rate_limiter: TokenBucket, audit_mode: str = "1"):
         self.api_key = api_key
         self.model = model
         self.rate_limiter = rate_limiter
-        self.endpoint = "https://api.groq.com/openai/v1/chat/completions"
+        self.audit_mode = audit_mode
+        self.endpoint = "https://api.openai.com/v1/chat/completions"
         self.vulnerabilities_found = []
         self.files_scanned = 0
         self.total_tokens = 0
         
     def get_system_prompt(self) -> str:
-        # Phase 1: Dynamic Rule Ingestion from .semanticguard/system_rules.md
-        rules_dir = Path(__file__).parent.parent
-        rules_path = rules_dir / ".semanticguard" / "system_rules.md"
-        try:
-            with open(rules_path, 'r', encoding='utf-8') as f:
-                dynamic_rules = f.read().strip()
-        except FileNotFoundError:
-            dynamic_rules = ""
+        # Phase 1: Dynamic Rule Ingestion (Only if Full Context Audit selected)
+        dynamic_rules = ""
+        if self.audit_mode == "2":
+            rules_dir = Path(__file__).parent.parent
+            rules_path = rules_dir / ".semanticguard" / "system_rules.md"
+            try:
+                with open(rules_path, 'r', encoding='utf-8') as f:
+                    dynamic_rules = f.read().strip()
+            except FileNotFoundError:
+                dynamic_rules = ""
         
         # Format dynamic rules block only if file was found
         rules_block = f"""
@@ -409,10 +400,24 @@ PROJECT-SPECIFIC SECURITY RULES (Loaded from security_rules.md):
 ===============================================================================
 """ if dynamic_rules else ""
         
-        return f"""You are an AGGRESSIVE AppSec auditor focused on EXPLOITABILITY, not patterns.
+        return f"""### 🛡️ THE UNIFIED AUDIT MATRIX (STRICT EVALUATION PROTOCOL)
+**ROLE:** High-Precision Logic Engine. You must PROVE a vulnerability exists using strict constraint validation. Use the **VULNERABILITY EQUATION**: `[Untrusted Source]` + `[Dangerous Sink]` + `[MISSING Taint-Breaker]`.
 
-Your job is to find REAL, EXPLOITABLE security issues. Avoid false positives.
+**THE GAG ORDER:** 
+You may ONLY flag critical security vulnerabilities (Injection, IDOR, SSRF, Deserialization, Hardcoded Secrets). 
+**FORBIDDEN:** Do NOT flag "Code Quality," "Deprecated Libraries" (e.g., `mysql` package), or "Missing Error Handling." If a finding is not a proven exploit, ignore it.
 
+**VALID TAINT-BREAKERS (IF PRESENT = SAFE):**
+1. **SSRF Guard:** Input URL's network location (`netloc`) validated against a hardcoded domain whitelist (`ALLOWED_DOMAINS`).
+2. **SQL/ORM Guard:** Parameterized queries (`?`, `%s`) or ORM operators (e.g., `Op.like`). String concatenation of wildcards (`'%' + val + '%'`) *inside* an ORM/parameterized sink is SAFE.
+3. **JWT Guard:** Verification using a hardcoded secret *coupled* with enforced secure algorithms (e.g., `algorithms=['HS256']`).
+4. **NoSQL Guard:** Explicit type-casting (`String(val)`, `Number(val)`) of user input before a query. 
+5. **Auth/Gate Guard:** Strict authorization checks (`verify_token()`, `user_id == current_user`) or whitelist validation *before* a sensitive sink. If missing, flag as CRITICAL Missing Authorization.
+6. **Schema Guard:** Raw payloads (`request.json`, `req.body`) parsed through any schema validator (Zod, Joi, jsonschema). If missing, flag as CRITICAL Unvalidated Deserialization.
+
+**TRUSTED SOURCES (NEVER FLAG AS VULNERABLE):**
+- Environment variables (`os.getenv()`, `process.env`).
+- Hardcoded local configuration constants (e.g., `users.db`, `db.sqlite`).
 ===============================================================================
 {rules_block}
 EXECUTION CONTROL ANALYSIS (spawn, subprocess, exec):
@@ -586,86 +591,26 @@ OUTPUT FORMAT — respond with ONLY this JSON, no markdown, no extra text:
 If safe, output exactly: {{"findings": []}}
 """
     
-    async def audit_file(self, file_path: Path, current: int = None, total: int = None, file_token_count: int = None) -> Dict:
-        """Audit a single file with global leaky bucket rate limiting
-        
-        Uses globally shared token state with asyncio.Lock() to prevent bursts.
-        Skips files > 25,000 tokens (too large for free tier).
-        
-        Args:
-            file_path: Path to the file to audit
-            current: Current file index (for progress display)
-            total: Total files to audit (for progress display)
-            file_token_count: Pre-calculated token count for this file
-        """
+    async def audit_file(self, file_path: Path, estimated_tokens: int) -> Dict:
+        """Audit a single file. Rate limiting and pre-consumption is handled by the Orchestrator."""
         max_retries = 3
         retry_count = 0
         
         def get_timestamp():
-            """Get current timestamp with milliseconds"""
             now = datetime.now()
-            return now.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
+            return now.strftime("%H:%M:%S.%f")[:-3]
         
-        # Read file
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             code = f.read()
         
-        # Prepend line numbers to every line so the LLM can reference them precisely
         numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(code.splitlines())]
         numbered_code = "\n".join(numbered_lines)
-        
-        # Estimate tokens (rough: 1 token ? 4 chars)
-        estimated_tokens = len(numbered_code) // 4 + 500
-        
-        # Check if file is too large for free tier
-        if estimated_tokens > self.rate_limiter.max_file_tokens:
-            timestamp = get_timestamp()
-            print(f"{colored(f'[{timestamp}] [SKIP: {estimated_tokens:,} tokens > {self.rate_limiter.max_file_tokens:,} max]', Colors.YELLOW)}")
-            return {
-                "file": str(file_path),
-                "status": "skipped",
-                "reason": f"File too large ({estimated_tokens:,} tokens)",
-                "latency": 0
-            }
-        
-        # Task 2: Account for LLM output tokens (reserve 2000 tokens for response)
-        # Consume input tokens + 2000 for the AI's response
-        total_tokens_to_consume = estimated_tokens + 2000
-        
-        # GLOBAL LEAKY BUCKET: Wait for token availability
-        wait_time = await self.rate_limiter.consume_with_wait(total_tokens_to_consume)
-        
-        # Task 1: Print progress AFTER rate limiting completes
-        # This ensures logging only happens when the file is actually being sent
-        if current is not None and total is not None:
-            timestamp = get_timestamp()
-            print(f"{colored(f'[{timestamp}] [{current}/{total}]', Colors.CYAN)} {colored(file_path.name, Colors.DIM)} {colored(f'[{estimated_tokens:,} input + 2000 output tokens]', Colors.YELLOW)}")
-        
-        # Print throttling info with timestamp
-        if wait_time > 0:
-            timestamp = get_timestamp()
-            print(f"{colored(f'[{timestamp}] [Wait: {wait_time:.2f}s for {total_tokens_to_consume:,} tokens]', Colors.CYAN)}")
+        system_prompt = self.get_system_prompt()
         
         while retry_count <= max_retries:
             try:
-                # Make API call (non-blocking via asyncio.to_thread)
                 start_time = time.time()
-                
-                # 🔍 DEBUG INSTRUMENTATION: Capture raw payload before API call
-                system_prompt = self.get_system_prompt()
                 user_prompt = f"Audit this code (each line prefixed with its line number):\n\n{numbered_code}"
-                DEBUG_PAYLOAD = {
-                    "system_prompt": system_prompt,
-                    "user_prompt": user_prompt,
-                    "model": self.model,
-                    "temperature": 0.3,
-                    "max_tokens": 500,
-                }
-                if self.model != "openai/gpt-oss-120b":
-                    DEBUG_PAYLOAD["response_format"] = {"type": "json_object"}
-                with open("debug_stress_payload.json", "w", encoding="utf-8") as f:
-                    json.dump(DEBUG_PAYLOAD, f, indent=2)
-                print(f"{colored('[DEBUG] Payload written to debug_stress_payload.json', Colors.YELLOW)}")
                 
                 json_payload = {
                     "model": self.model,
@@ -676,7 +621,7 @@ If safe, output exactly: {{"findings": []}}
                     "temperature": 0.3,
                     "max_tokens": 500,
                 }
-                if self.model != "openai/gpt-oss-120b":
+                if "gpt" not in self.model: # support custom format
                     json_payload["response_format"] = {"type": "json_object"}
                     
                 response = await asyncio.to_thread(
@@ -693,74 +638,52 @@ If safe, output exactly: {{"findings": []}}
                 elapsed = time.time() - start_time
                 
                 if response.status_code != 200:
-                    # Refund tokens on error (we reserved total_tokens_to_consume)
-                    self.rate_limiter.refund(total_tokens_to_consume, 0)
-                    
-                    # Self-healing: Special handling for 429 (rate limit) errors
-                    if response.status_code == 429:
-                        if retry_count < max_retries:
-                            retry_count += 1
-                            # Set global pause for ALL tasks
-                            await self.rate_limiter.set_global_pause(30.0)
-                            timestamp = get_timestamp()
-                            print(f"{colored(f'[{timestamp}] [429 GLOBAL PAUSE! All tasks sleeping 30s...]', Colors.RED)}")
-                            await asyncio.sleep(30)  # Wait 30 seconds for Groq to reset
-                            continue
-                        else:
-                            return {
-                                "file": str(file_path),
-                                "status": "error",
-                                "error": f"HTTP 429: Rate limit exceeded after {max_retries} retries",
-                                "latency": elapsed
-                            }
-                    
-                    # Retry on other timeout errors (408, 504)
-                    if response.status_code in [408, 504] and retry_count < max_retries:
+                    if response.status_code in [429, 408, 504] and retry_count < max_retries:
                         retry_count += 1
                         backoff_time = 15
                         timestamp = get_timestamp()
-                        print(f"{colored(f'[{timestamp}] [HTTP {response.status_code} Error! Waiting {backoff_time:.2f}s before retry {retry_count}/{max_retries}...]', Colors.YELLOW)}")
+                        print(f"\n{colored(f'[{timestamp}] [HTTP {response.status_code} Error on {file_path.name}! Waiting {backoff_time:.2f}s...]', Colors.YELLOW)}")
                         await asyncio.sleep(backoff_time)
                         continue
                     
-                    timestamp = get_timestamp()
-                    print(f"{colored(f'[{timestamp}] [HTTP {response.status_code} Error: {response.text[:50]}]', Colors.RED)}")
                     return {
                         "file": str(file_path),
                         "status": "error",
                         "error": f"HTTP {response.status_code}: {response.text[:100]}",
-                        "latency": elapsed
+                        "latency": elapsed,
+                        "headers": dict(response.headers)
                     }
                 
                 data = response.json()
                 tokens_used = data.get("usage", {}).get("total_tokens", estimated_tokens)
                 result = data["choices"][0]["message"]["content"]
                 
-                # Refund difference if actual is lower than estimate
-                # We reserved (estimated_tokens + 2000), so refund the difference
-                self.rate_limiter.refund(total_tokens_to_consume, tokens_used)
+                if result is None or not result.strip():
+                    return {
+                        "file": str(file_path),
+                        "status": "error",
+                        "error": "Empty response content from provider",
+                        "latency": elapsed,
+                        "headers": dict(response.headers)
+                    }
+
                 self.total_tokens += tokens_used
                 self.files_scanned += 1
                 
-                # Phase 3: Parse findings array response
                 any_vulnerable = False
                 
                 try:
                     parsed = json.loads(result.strip())
-                    
-                    # Normalize findings to a list
                     findings = []
                     if isinstance(parsed, list):
                         findings = parsed
                     elif isinstance(parsed, dict):
                         findings = parsed.get("findings", [])
-                        # Handle stringified array
                         if isinstance(findings, str) and findings.strip().startswith("["):
                             try:
                                 findings = json.loads(findings)
                             except:
                                 findings = []
-                        # Fallback to single-object schema
                         if (not findings or not isinstance(findings, list)) and "is_vulnerable" in parsed:
                             findings = [parsed]
                     
@@ -786,16 +709,13 @@ If safe, output exactly: {{"findings": []}}
                                 "type": vuln_type,
                                 "line": line
                             })
-                
                 except json.JSONDecodeError as e:
-                    timestamp = get_timestamp()
-                    print(f"{colored(f'[{timestamp}] [JSON Parse Error: {str(e)[:50]}]', Colors.RED)}")
                     return {
                         "file": str(file_path),
                         "status": "error",
                         "error": f"JSON parse error: {str(e)[:100]}",
                         "latency": elapsed,
-                        "raw_response": result[:200]
+                        "headers": dict(response.headers)
                     }
                 
                 return {
@@ -803,110 +723,120 @@ If safe, output exactly: {{"findings": []}}
                     "status": "vulnerable" if any_vulnerable else "safe",
                     "finding": self.vulnerabilities_found[-1]["summary"] if any_vulnerable else None,
                     "tokens": tokens_used,
-                    "latency": elapsed
+                    "latency": elapsed,
+                    "headers": dict(response.headers)
                 }
             
             except (requests.Timeout, asyncio.TimeoutError) as e:
                 if retry_count < max_retries:
                     retry_count += 1
-                    backoff_time = 15
-                    timestamp = get_timestamp()
-                    print(f"{colored(f'[{timestamp}] [Timeout! Waiting {backoff_time:.2f}s before retry {retry_count}/{max_retries}...]', Colors.YELLOW)}")
-                    await asyncio.sleep(backoff_time)
+                    await asyncio.sleep(15)
                     continue
-                
-                timestamp = get_timestamp()
-                print(f"{colored(f'[{timestamp}] [Timeout Error after {max_retries} retries]', Colors.RED)}")
                 return {
-                    "file": str(file_path),
-                    "status": "error",
-                    "error": f"Timeout after {max_retries} retries",
-                    "latency": 0
+                    "file": str(file_path), "status": "error", "error": f"Timeout after {max_retries} retries", "latency": 0
                 }
             
             except Exception as e:
-                timestamp = get_timestamp()
-                print(f"{colored(f'[{timestamp}] [Exception: {str(e)[:50]}]', Colors.RED)}")
                 return {
-                    "file": str(file_path),
-                    "status": "error",
-                    "error": str(e),
-                    "latency": 0
+                    "file": str(file_path), "status": "error", "error": str(e), "latency": 0
                 }
         
-        timestamp = get_timestamp()
-        print(f"{colored(f'[{timestamp}] [Unknown error after retries]', Colors.RED)}")
         return {
-            "file": str(file_path),
-            "status": "error",
-            "error": "Unknown error after retries",
-            "latency": 0
+            "file": str(file_path), "status": "error", "error": "Unknown error after retries", "latency": 0
         }
     
     async def audit_codebase(self, files: List[Path], concurrency: int = 1):
-        """Audit multiple files with concurrency control, live timestamps, and token tracking"""
-        print(f"\n{colored('>>> Starting audit...', Colors.CYAN)}")
-        print(f"{colored(f'Model: {self.model} | Max RPM: {self.rate_limiter.max_rpm} | Max TPM: {self.rate_limiter.max_tpm:,}', Colors.DIM)}")
-        print(f"{colored(f'Max File Size: {self.rate_limiter.max_file_tokens:,} tokens (20% of TPM capacity)', Colors.DIM)}\n")
+        """Audit codebase using deterministic Dual-Gate logic and 10-File Nitro Bursts"""
+        print(f"\n{colored('>>> Starting OpenAI Tier-5 Audit...', Colors.CYAN)}")
+        print(f"{colored(f'Model: {self.model} | Max RPM: {self.rate_limiter.max_rpm} | Max TPM: {self.rate_limiter.max_tpm:,}', Colors.DIM)}\n")
         
-        def get_timestamp():
-            """Get current timestamp with milliseconds"""
-            now = datetime.now()
-            return now.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
-        
+        system_prompt = self.get_system_prompt()
+        prompt_overhead_tokens = len(system_prompt.encode('utf-8')) // 3
+
         def estimate_tokens(file_path: Path) -> int:
-            """Estimate tokens for a file (1 token ? 4 chars)"""
             try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    code = f.read()
-                return len(code) // 4 + 500
+                # 1:3 token-byte logic + system prompt overhead + output token padding
+                size_bytes = file_path.stat().st_size
+                return int(size_bytes / 3) + prompt_overhead_tokens + 2000
             except:
                 return 500
-        
-        # Pre-calculate token counts for all files
-        file_tokens = {}
-        total_tokens_estimate = 0
-        for file_path in files:
-            tokens = estimate_tokens(file_path)
-            file_tokens[str(file_path)] = tokens
-            total_tokens_estimate += tokens
-        
-        semaphore = asyncio.Semaphore(concurrency)
+
         total_files = len(files)
-        file_counter = {"count": 0}  # Shared counter for progress
-        tokens_processed = {"count": 0}  # Shared token counter
+        files_processed = 0
+        queue = files.copy()
+        results = []
         
-        async def audit_with_semaphore(file_path):
-            async with semaphore:
-                file_counter["count"] += 1
-                current = file_counter["count"]
-                timestamp = get_timestamp()
-                
-                # Get token count for this file
-                file_token_count = file_tokens.get(str(file_path), 500)
-                
-                # Enforce dynamic file cap based on TPM
-                if file_token_count > self.rate_limiter.max_file_tokens:
-                    print(f"{colored(f'[{timestamp}] [{current}/{total_files}] [SKIPPED]', Colors.YELLOW)} {colored(file_path.name, Colors.DIM)} {colored(f'is too large ({file_token_count:,} tokens > {self.rate_limiter.max_file_tokens:,} limit)', Colors.RED)}")
-                    return {
-                        "file": str(file_path),
-                        "status": "skipped",
-                        "reason": f"File too large ({file_token_count:,} tokens > {self.rate_limiter.max_file_tokens:,} limit)",
-                        "latency": 0
-                    }
-                
-                # Task 1: Print progress AFTER rate limiting completes (moved inside audit_file)
-                # The logging will now happen after consume_with_wait() succeeds
-                result = await self.audit_file(file_path, current, total_files, file_token_count)
-                
-                # Update tokens processed
-                tokens_processed["count"] += file_token_count
-                
-                return result
+        # Max concurrent burst capacity
+        MAX_BURST = 10
         
-        tasks = [audit_with_semaphore(f) for f in files]
-        results = await asyncio.gather(*tasks)
-        
+        while queue:
+            # Prepare next safe burst
+            burst_files = []
+            burst_costs = []
+            
+            # Extract first file to lead the burst
+            next_file = queue[0]
+            next_cost = estimate_tokens(next_file)
+            
+            # Giant File Fail-Safe Check
+            if next_cost > self.rate_limiter.max_tpm:
+                print(f"\n{colored(f'[!] FILE TOO LARGE: {next_file.name} ({next_cost:,} tokens). Skipping for manual review.', Colors.YELLOW)}")
+                results.append({"file": str(next_file), "status": "skipped"})
+                queue.pop(0)
+                files_processed += 1
+                continue
+                
+            # Guaranteed pre-consumption and deterministic sleep for the leader
+            wait_time = await self.rate_limiter.consume(next_cost, 1.0)
+            if wait_time > 0:
+                state = await self.rate_limiter.get_state()
+                print(f"[HUD] TPM: {state['tpm_pct']}% | RPM: {state['rpm_pct']}% | Active Bursts: SLEEPING ({wait_time:.2f}s) | Queue: {files_processed}/{total_files} ", end="\r", flush=True)
+                await asyncio.sleep(wait_time)
+            
+            burst_files.append(next_file)
+            burst_costs.append(next_cost)
+            queue.pop(0)
+            
+            # Add up to 9 more files IF they fit precisely into current bucket dimensions
+            while queue and len(burst_files) < MAX_BURST:
+                candidate = queue[0]
+                cand_cost = estimate_tokens(candidate)
+                
+                if cand_cost > self.rate_limiter.max_tpm:
+                    queue.pop(0) # Giant file fail-safe
+                    results.append({"file": str(candidate), "status": "skipped"})
+                    files_processed += 1
+                    continue
+                
+                state = await self.rate_limiter.get_state()
+                if cand_cost <= state["tokens"] and 1.0 <= state["requests"]:
+                    await self.rate_limiter.consume(cand_cost, 1.0)
+                    burst_files.append(candidate)
+                    burst_costs.append(cand_cost)
+                    queue.pop(0)
+                else:
+                    break # Gate closed, close the burst pool!
+
+            # Burst Fire Phase
+            state = await self.rate_limiter.get_state()
+            hud_msg = f"[HUD] TPM: {state['tpm_pct']}% | RPM: {state['rpm_pct']}% | Active Bursts: {len(burst_files)}/10 | Queue: {files_processed}/{total_files}      "
+            print(hud_msg, end="\r", flush=True)
+            
+            tasks = [self.audit_file(f, c) for f, c in zip(burst_files, burst_costs)]
+            burst_results = await asyncio.gather(*tasks)
+            results.extend(burst_results)
+            files_processed += len(burst_files)
+            
+            # Post-Burst Calibration
+            latest_headers = None
+            for res in burst_results:
+                if "headers" in res:
+                    latest_headers = res["headers"]
+            
+            if latest_headers:
+                await self.rate_limiter.calibrate(latest_headers)
+                
+        print("\n\n" + colored("[OK] Codebase traversal complete.", Colors.GREEN))
         return results
 
 # --- Terminal UI ------------------------------------------------------------
@@ -926,140 +856,42 @@ def get_api_key() -> str:
         sys.exit(1)
     return api_key
 
-def detect_model_limits(api_key: str, model_name: str) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Detect model's TPM/RPM limits by querying Groq API.
-    Returns (max_rpm, max_tpm) or (None, None) if detection fails.
-    """
-    try:
-        print(f"\n{colored('[SCAN] Detecting model limits from Groq API...', Colors.CYAN)}")
-        
-        # Try to get model info from Groq API
-        # Note: Groq doesn't have a dedicated models endpoint, so we'll make a minimal test call
-        # and check the rate limit headers in the response
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": model_name,
-                "messages": [{"role": "user", "content": "test"}],
-                "max_tokens": 1
-            },
-            timeout=10
-        )
-        
-        # DEBUG: Print ALL headers to see exact naming
-        headers = response.headers
-        print(f"\n{colored('? DEBUG: ALL RESPONSE HEADERS', Colors.YELLOW)}")
-        print(f"{colored('=' * 70, Colors.YELLOW)}")
-        for key, value in headers.items():
-            if 'rate' in key.lower() or 'limit' in key.lower():
-                print(f"{colored(f'{key}: {value}', Colors.YELLOW)}")
-        print(f"{colored('=' * 70, Colors.YELLOW)}\n")
-        
-        max_rpm = None
-        max_tpm = None
-        
-        # Groq API headers (based on actual API response):
-        # x-ratelimit-limit-requests: RPD (Requests Per Day) - e.g., 500000
-        # x-ratelimit-limit-requests-minute: RPM (Requests Per Minute) - e.g., 1000
-        # x-ratelimit-limit-tokens: TPM (Tokens Per Minute) - e.g., 300000
-        
-        # Search for RPM header (must contain "minute" to avoid RPD confusion)
-        for key, value in headers.items():
-            key_lower = key.lower()
-            # Look for headers with "ratelimit", "request", "limit", AND "minute"
-            if 'ratelimit' in key_lower and 'request' in key_lower and 'limit' in key_lower and 'minute' in key_lower:
-                try:
-                    max_rpm = int(value)
-                    print(f"{colored(f'   [OK] Found RPM header: {key} = {max_rpm}', Colors.GREEN)}")
-                    break
-                except ValueError:
-                    pass
-        
-        # If no "minute" header found, fall back to checking for RPD and warn user
-        if not max_rpm:
-            for key, value in headers.items():
-                key_lower = key.lower()
-                if 'ratelimit' in key_lower and 'request' in key_lower and 'limit' in key_lower:
-                    try:
-                        rpd_value = int(value)
-                        print(f"{colored(f'   [WARN]  Found RPD (Requests Per Day) header: {key} = {rpd_value:,}', Colors.YELLOW)}")
-                        print(f"{colored(f'   [WARN]  No RPM (Requests Per Minute) header found', Colors.YELLOW)}")
-                        print(f"{colored(f'   [WARN]  Estimating RPM as RPD / 1440 (minutes per day)', Colors.YELLOW)}")
-                        max_rpm = rpd_value // 1440  # Rough estimate: RPD / minutes per day
-                        print(f"{colored(f'   [RESULTS] Estimated RPM: {max_rpm}', Colors.CYAN)}")
-                        break
-                    except ValueError:
-                        pass
-        
-        # Search for TPM header
-        for key, value in headers.items():
-            key_lower = key.lower()
-            if 'ratelimit' in key_lower and 'token' in key_lower and 'limit' in key_lower:
-                try:
-                    max_tpm = int(value)
-                    print(f"{colored(f'   [OK] Found TPM header: {key} = {max_tpm:,}', Colors.GREEN)}")
-                    break
-                except ValueError:
-                    pass
-        
-        if max_rpm and max_tpm:
-            print(f"{colored(f'[OK] Detected from API: Max RPM: {max_rpm} | Max TPM: {max_tpm:,}', Colors.GREEN)}")
-            
-            # Show if this is an upgraded account
-            if max_tpm >= 500000:
-                print(f"{colored(f'>>> UPGRADED ACCOUNT! You have {max_tpm:,} TPM', Colors.GREEN)}")
-            
-            return max_rpm, max_tpm
-        else:
-            print(f"{colored('[WARN]  Could not detect limits from API headers', Colors.YELLOW)}")
-            
-            # Debug: Print all headers to help troubleshoot
-            print(f"{colored('   Available rate-limit headers:', Colors.DIM)}")
-            for key in headers.keys():
-                if 'rate' in key.lower() or 'limit' in key.lower():
-                    print(f"{colored(f'   - {key}: {headers[key]}', Colors.DIM)}")
-            
-            return None, None
-            
-    except Exception as e:
-        print(f"{colored(f'[WARN]  API detection failed: {str(e)[:50]}', Colors.YELLOW)}")
-        return None, None
-
 def select_model(api_key: str) -> Tuple[str, str, int, int]:
     """Interactive model selection with automatic TPM detection"""
     print(f"\n{colored('[RESULTS] Available Models:', Colors.CYAN)}")
-    for key, model_info in GROQ_MODELS.items():
+    for key, model_info in OPENAI_MODELS.items():
         print(f"  {key}. {model_info['display']}")
         if model_info['max_rpm'] and model_info['max_tpm']:
             print(f"     Max RPM: {model_info['max_rpm']} | Max TPM: {model_info['max_tpm']}")
         else:
             print(f"     {colored('(You will enter TPM manually)', Colors.DIM)}")
     
-    choice = input(f"\n{colored('Select model (1, 2, 3, or 4): ', Colors.YELLOW)}")
+    choice = input(f"\n{colored('Select model (1 or 2): ', Colors.YELLOW)}")
     
-    if choice not in GROQ_MODELS:
+    if choice not in OPENAI_MODELS:
         print(f"{colored('[ERROR] Invalid choice', Colors.RED)}")
         sys.exit(1)
     
-    model_info = GROQ_MODELS[choice]
+    model_info = OPENAI_MODELS[choice]
     
     # Handle custom model with manual TPM entry
-    if choice == "4":
+    if choice == "2":
         print(f"\n{colored('? Custom Model Configuration', Colors.CYAN)}")
         
         # Get model name
-        model_name = input(f"{colored('Enter model name (e.g., meta-llama/llama-4-scout-17b-16e-instruct): ', Colors.YELLOW)}").strip()
+        model_name = input(f"{colored('Enter model name (e.g., gpt-4o): ', Colors.YELLOW)}").strip()
         if not model_name:
             print(f"{colored('[ERROR] Model name cannot be empty', Colors.RED)}")
             sys.exit(1)
         
-        # Try to detect limits from API
-        detected_rpm, detected_tpm = detect_model_limits(api_key, model_name)
+        # Try to detect limits from API by loading dummy bucket
+        try:
+            print(f"\n{colored('[SCAN] Detecting model limits from OpenAI API...', Colors.CYAN)}")
+            bucket = TokenBucket.auto_detect(api_key, model_name)
+            detected_rpm = int(bucket.max_rpm)
+            detected_tpm = int(bucket.max_tpm)
+        except Exception:
+            detected_rpm, detected_tpm = None, None
         
         if detected_rpm and detected_tpm:
             # Use detected limits
@@ -1108,7 +940,13 @@ def select_model(api_key: str) -> Tuple[str, str, int, int]:
     print(f"{colored(f'Default limits: Max RPM: {default_rpm} | Max TPM: {default_tpm:,}', Colors.DIM)}")
     
     # Try to detect actual limits from API
-    detected_rpm, detected_tpm = detect_model_limits(api_key, model_name)
+    try:
+        print(f"\n{colored('[SCAN] Detecting model limits from OpenAI API...', Colors.CYAN)}")
+        bucket = TokenBucket.auto_detect(api_key, model_name)
+        detected_rpm = int(bucket.max_rpm)
+        detected_tpm = int(bucket.max_tpm)
+    except Exception:
+        detected_rpm, detected_tpm = None, None
     
     if detected_rpm and detected_tpm:
         # Check if detected limits are higher than defaults
@@ -1444,13 +1282,32 @@ async def main():
     model_name, model_choice, max_rpm, max_tpm = select_model(api_key)
     codebase_path = get_codebase_path()
     
+    # Selection of Audit Mode
+    print(f"\n{colored('========================================', Colors.CYAN)}")
+    print(f"{colored(' 🛡️  SEMANTICGUARD STRESS TEST', Colors.BOLD)}")
+    print(f"{colored('========================================', Colors.CYAN)}")
+    print("Select Audit Mode:")
+    print(f"[{colored('1', Colors.YELLOW)}] Pure Security Audit (Strict AppSec only, ignores system_rules.md)")
+    print(f"[{colored('2', Colors.YELLOW)}] Full Context Audit (AppSec + system_rules.md enforcement)")
+    
+    audit_choice = input(f"\n{colored('>', Colors.CYAN)} ").strip()
+    if audit_choice not in ["1", "2"]:
+        audit_choice = "1" # Default to 1
+        
+    print(f"{colored(f'[OK] Mode selected: {audit_choice}', Colors.GREEN)}")
+    
     # File extensions to scan
     extensions = ['.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rb', '.php', '.cs', '.json']
     
     # Initialize components
-    rate_limiter = TokenBucket(max_rpm, max_tpm)
+    print(f"\n{colored('[*] Probing OpenAI API for exact Tier limits...', Colors.CYAN)}")
+    try:
+        rate_limiter = TokenBucket.auto_detect(api_key, model_name)
+    except Exception:
+        rate_limiter = TokenBucket(max_rpm, max_tpm)
+    
     scanner = CodebaseScanner(codebase_path, extensions, max_size_kb=500)
-    client = GroqAuditClient(api_key, model_name, rate_limiter)
+    client = OpenAIAuditClient(api_key, model_name, rate_limiter, audit_mode=audit_choice)
     
     # Scan codebase (Layer1PreScreener applied during scan, files sorted by risk score)
     files = scanner.scan()

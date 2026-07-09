@@ -194,3 +194,37 @@ REBRAND_COMPLETE.md
 *_WIP.md
 *_OLD.md
 *_BACKUP.md
+
+# ─── Threat Intel & Internal Tools (Audited) ───────────────────────────────
+threat_intel/
+UsersethanDesktopTrepanthreat_intelclonesgithub-for-jira_20260331_003047/
+tainted_secret_sniper.py
+zero_days_found.json
+global_map.json
+poc.py
+nvidia_stress_test.py
+test_clone/
+tmp_verify_indexer.py
+where_is_it.py
+user_a.json
+mock_laravel/
+atlassian-python-api/
+fun_and_games/
+atlassian-python-api/tests
+semanticguard_server/tests
+semanticguard_server/direct_api_test.py
+semanticguard_server/run_diagnostic_tests.py
+semanticguard_server/test_sink_registry.py
+
+# Track the public scanner/indexer slice and its runtime support files.
+!hunter.py
+!indexer.py
+!st/
+!st/**
+st/__pycache__/
+!semanticguard_utils/
+!semanticguard_utils/**
+semanticguard_utils/__pycache__/
+!threat_intel/
+threat_intel/*
+!threat_intel/signatures.py
